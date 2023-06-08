@@ -1,1 +1,1 @@
-## Virtual Age Model in Julia
+## Moving VAM to julia
