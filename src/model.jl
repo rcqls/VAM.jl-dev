@@ -46,14 +46,21 @@ mutable struct Model <: AbstractModel
 	comp::Compute
 
 	# Additional Covariates stuff
-	data_cov::DataFrame
+	datacov::DataFrame
+	vars_cov::Vector{Symbol}
 	params_cov::Vector{Float64}
 	sum_cov::Float64 #to save the computation
+	expr_cov::Union{Nothing, Expr}
 
 	# Formula
 	formula::Expr
 
-	Model() = new()
+	Model() = begin
+		m = new()
+		# init!(m)
+		init_covariates!(m)
+		return m
+	end
 end
 
 function init!(m::Model)
@@ -73,19 +80,13 @@ function init!(m::Model)
 		m.id_params_list = Int[]
 		for (id, mm) in enumerate(m.models)
 			push!(m.id_params_list, cur_id_params)
-			m.nb_params_maintenance += nb_params(mm)
-			cur_id_params += nb_params(mm)
+			m.nb_params_maintenance += nbparams(mm)
+			cur_id_params += nbparams(mm)
 		end
-		m.nb_params_family = nb_params(m.family)
-		m.nb_params_cov = 0
+		m.nb_params_family = nbparams(m.family)
 		m.mu = max_memory(m)
 
 		m.data=DataFrame[]
-
-		# Additional Covariates stuff
-		m.data_cov = DataFrame()
-		m.params_cov = Float64[]
-		m.sum_cov = 0 #to save the computation
 
 		## internal
 		m.time = Float64[]
@@ -118,26 +119,42 @@ function init!(m::Model)
 		return nothing
 end
 
+function init_covariates!(m::Model)
+	# Additional Covariates stuff
+	m.nb_params_cov = 0
+	m.datacov = DataFrame()
+	m.params_cov = Parameter[]
+	m.sum_cov = 0 #to save the computation
+	m.expr_cov = nothing
+end
+
 function inc!(m::Model)
 	m.k += 1
 	m.Δt = m.time[m.k] - m.time[m.k - 1]
 end
 
-nb_params(m::Model)::Int = m.nb_params_family + m.nb_params_maintenance + n.nb_params_cov
+nbparams(m::Model)::Int = m.nb_params_family + m.nb_params_maintenance + m.nb_params_cov
 
-params(m::Model)::Vector{Float64} = cat(params(m.family),(map(m.models) do mm;params(mm); end)...,dims=1)
+params(m::Model)::Parameters = cat(params(m.family),(map(m.models) do mm;params(mm); end)...,m.params_cov,dims=1)
 
 function params!(m::Model, θ::Vector{Float64})
-	from, to = 1, nb_params(m.family)
+	from, to = 1, nbparams(m.family)
 	params!(m.family,θ[from:to])
 	for mm in m.models
-		if nb_params(mm) > 0
+		if nbparams(mm) > 0
 			from = to + 1
-			to = from + nb_params(mm) - 1
+			to = from + nbparams(mm) - 1
 			params!(mm, θ[from:to])
 		end
 	end
+	if m.nb_params_cov > 0
+		for i in 1:m.nb_params_cov
+			m.params_cov[i] = θ[to + i]
+		end
+	end
 end
+
+priors(m::Model)::Priors = cat(m.family.priors,(map(m.models) do mm;mm.priors; end)...,dims=1)
 
 function init_compute!(m::Model)
 	init!(m.comp)
@@ -223,19 +240,20 @@ function data!(m::Model,data::Union{DataFrame,Vector{DataFrame}})
 			end
 		end
 	end
-	select_data(m,1) #;//default when only one system no need to
+	data!(m,1) #;//default when only one system no need to
 end
 
-function select_data(m::Model, i::Int)
+function data!(m::Model, i::Int)
 	if length(m.data) >= i
 		data=m.data[i]
 		m.time = data[!,1]
 		m.type = data[!,2]
+		m.current_system = i
 	end
 end
 
-function selected_data(m::Model, i::Int)::DataFrame
-	select_data(m, i) #;//Skipped if data is unset (see above)
+function data(m::Model, i::Int)::DataFrame
+	data!(m, i) #;//Skipped if data is unset (see above)
 	return DataFrame(time=m.time,type=m.type)
 end
 
@@ -325,23 +343,39 @@ function select_current_system(m::Model, i::Int, compute::Bool)
 end
 
 # //Covariates related
-function covariates!(m::Model, params::Vector{Float64}, data::DataFrame) 
-	m.sum_cov = 0.0
-	m.data_cov = data
-	m.params_cov = params
-	m.nb_params_cov = length(m.params_cov)
+function covariates!(m::Model,formula::Expr)
+	if !isnothing(formula)
+		m.expr_cov = formula
+		m.params_cov = Parameter[]
+		m.vars_cov = Symbol[]
+		for (p, v) in map(x -> x.args[2:end], formula.args[2:end])
+			push!(m.params_cov, p)
+			push!(m.vars_cov, v)
+		end
+		m.nb_params_cov = length(m.params_cov)
+	end
+end
+
+covariates!(m::Model) = covariates!(m, m.expr_cov)
+
+function covariates!(m::Model, data::DataFrame) 
+	m.datacov = data[!,m.vars_cov]
+	m.nb_params_cov = size(m.datacov)[2]
 end
 
 function compute_covariates(m::Model)
 	m.sum_cov = 0.0
+	# println(m.params_cov)
+	# println(m.datacov)
+	# println( (m.current_system, m.nb_params_cov, m.params_cov) )
 	for j in 1:m.nb_params_cov
-		m.sum_cov += m.params_cov[j] * m.data_cov[m.current_system, j]
+		m.sum_cov += m.params_cov[j] * m.datacov[m.current_system, m.vars_cov[j]]
 		# //printf("syst=%d,j=%d,th=%lf,params_cov=%lf\n",current_system,j,params_cov[j],var[current_system]);
 	end
 	return m.sum_cov
 end
 
-covariate(m::Model, j::Int) = m.data_cov[m.current_system, j]
+covariate(m::Model, j::Int) = m.datacov[m.current_system, j]
 
 has_maintenance_policy(m::Model)::Bool = isdefined(m,:maintenance_policy) #|| !isnothing(m.maintenance_policy)
 
@@ -357,8 +391,12 @@ function max_memory(m::Model)::Int
 	return maxmem
 end
 
+function isbayesian(m::Model)::Bool
+	return all(map(isbayesian, m.models))
+end
+
 # Used inside ModelTest do guess the r formula and RData
-function rterms(m::Model, data::DataFrame)
+function rterms(m::Model, data::DataFrame, datacov::DataFrame=DataFrame())
 	f = m.formula
 	df_rexpr = string("data.frame(", 
 		join(map(names(data)) do var
@@ -377,5 +415,14 @@ function rterms(m::Model, data::DataFrame)
 		model_str = string("(",f.args[3],")")
 	end
 	vam_repxr = replace(string(vars_str, " ~ ", replace( model_str  ,"FamilyModel" => "")),"∞" => "Inf")
-	[df_rexpr, vam_repxr]
+	dfcov_rexpr = if isempty(datacov)
+		"NULL"
+	else
+		string("data.frame(", 
+			join(map(names(datacov)) do var
+				string(var,"=c(",join(datacov[!,var],","),")")
+			end,","),
+		")")
+	end
+	[df_rexpr, vam_repxr, dfcov_rexpr]
 end
